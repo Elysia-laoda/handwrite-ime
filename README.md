@@ -1,9 +1,16 @@
 # hwime — 悬浮手写输入法
 
+[![Python](https://img.shields.io/badge/Python-3.13-blue)](https://www.python.org/)
+[![UI](https://img.shields.io/badge/UI-PySide6-green)](https://doc.qt.io/qtforpython-6/)
+[![OCR](https://img.shields.io/badge/OCR-PP--OCRv6-orange)](https://github.com/PaddlePaddle/PaddleOCR)
+[![License](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
+
 在悬浮面板上像写字一样连续书写中文，识别出的规范文字自动打进当前焦点窗口。
 桌面常驻悬浮球一键开合；单行大格书写区带**笔锋渲染**与**笔尖预测**；
 毛玻璃 / 渐变 / 圆角 / 粒子特效 UI；双路识别（路 B 整行 OCR 主导上屏 +
 路 A 笔迹 CNN 供纠正菜单）。
+
+![面板预览](docs/panel_preview.png)
 
 ## 启动
 
