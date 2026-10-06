@@ -1,0 +1,7 @@
+_models/
+data/
+_ref/
+_session-temp/
+.mimosa/
+__pycache__/
+*.egg-info/

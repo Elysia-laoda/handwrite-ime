@@ -1,0 +1,12 @@
+# hwime 运行依赖（Python 3.13+）
+# 本机 venv：C:\Users\lab\.workbuddy\binaries\python\envs\hwime
+# 上游手写 CNN（另装，指向工作区参考仓库）：
+#   pip install -e C:\WBproject\_ref\cnn_chinese_hw
+PySide6
+onnxruntime
+rapidocr
+torch
+numpy
+Pillow
+jieba
+svg.path
