@@ -32,16 +32,23 @@ import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)                       # handwrite-ime/
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)                        # appcfg/settings 同目录
 if os.path.join(_ROOT, "engine") not in sys.path:
     sys.path.insert(0, os.path.join(_ROOT, "engine"))
 
+import appcfg                                        # noqa: E402
+
+appcfg.load()                                        # 先于任何面板构建
+
 from PySide6.QtCore import (QAbstractNativeEventFilter, QEvent, QPointF,
                             QRectF, QThread, Qt, QTimer, Signal)
-from PySide6.QtGui import (QBrush, QColor, QFontMetricsF, QImage,
+from PySide6.QtGui import (QBrush, QColor, QFontMetricsF, QIcon, QImage,
                            QLinearGradient, QPainter, QPainterPath, QPen,
                            QPixmap, QPolygonF, QRadialGradient)
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QMenu,
-                               QPushButton, QWidget)
+                               QMessageBox, QPushButton, QSystemTrayIcon,
+                               QWidget)
 
 from hwengine.ink import InkLine, render_cells_image
 from hwengine.pipeline import Pipeline
@@ -75,10 +82,9 @@ ACRYLIC_TINT_PANEL = 0x46EDF2F5          # ABGR：暖白磨砂（alpha 0x46≈70
 # 系统背景（需非分层窗口，属后续重做项）。
 USE_ACRYLIC_ACCENT = False
 
-# 实时背景模糊（WGC + 面板排除标记）。开：玻璃里背景实时更新，但面板
-# 与悬浮球会从**所有截屏/录屏**里消失（WDA_EXCLUDEFROMCAPTURE 的代价）；
-# 关：回退为"打开面板时抓一张背景做静态模糊"，面板可正常被截屏。
-LIVE_BLUR = True
+# 实时背景模糊开关已迁移到设置系统（appcfg.SCHEMA["live_blur"]，默认开）。
+# 说明：开=玻璃里背景实时更新，但面板/悬浮球会从**所有截屏/录屏**里消失
+# （WDA_EXCLUDEFROMCAPTURE 的代价）；关=打开面板时抓一张背景做静态模糊。
 INK_COLOR = QColor("#16213a")
 INK_SOFT = QColor("#41527a")
 GOLD = QColor("#d9a441")
@@ -242,6 +248,14 @@ class Particles:
             p.setBrush(QColor(140, 165, 215, max(4, int(255 * al))))
             p.drawEllipse(QPointF(xx, y), r, r)
 
+    def set_ambient(self, n: int):
+        """调整环境粒子数量（设置界面可实时调）。"""
+        n = max(0, int(n))
+        while len(self.ambient) > n:
+            self.ambient.pop()
+        while len(self.ambient) < n:
+            self.ambient.append(self._new_ambient())
+
     def paint_effects(self, p: QPainter):
         p.setPen(Qt.NoPen)
         for e in self.effects:
@@ -354,16 +368,17 @@ def save_ui_state(state: dict) -> None:
 
 
 def width_of(pressure: float) -> float:
-    """落笔线宽。数位板 pressure 实测恒为 ~0.02（未映射），不可用；
-    真实粗细由 _chain 里的速度模拟（快细慢粗）逐点决定。"""
-    return 5.0
+    """落笔线宽（设置可调）。数位板 pressure 实测恒为 ~0.02（未映射），
+    不可用；真实粗细由 _chain 里的速度模拟（快细慢粗）逐点决定。"""
+    return float(appcfg.SETTINGS["base_width"])
 
 
 def width_from_speed(dist: float) -> float:
     """速度→线宽：按原始帧间距（Windows Ink ~8-16ms/帧）估算。
-    基准加粗（5.0px）给笔锋留出对比空间：
-    慢写(帧距<4px)≈5.0px，快写(帧距≥22px)≈1.8px。"""
-    return 5.0 - 3.2 * min(1.0, dist / 22.0)
+    基准/调制幅度均由设置控制（默认 5.0px 慢写 / 降 3.2px 快写）。"""
+    base = float(appcfg.SETTINGS["base_width"])
+    span = float(appcfg.SETTINGS["speed_span"])
+    return base - span * min(1.0, dist / 22.0)
 
 
 def apply_stroke_taper(stroke: list[tuple]):
@@ -388,16 +403,19 @@ def apply_stroke_taper(stroke: list[tuple]):
     tail_u = min(0.46, max(10.0, min(48.0, 0.10 * total + 10.0)) / total)
 
     out = []
+    head_start = float(appcfg.SETTINGS["taper_head"])
+    mid_gain = float(appcfg.SETTINGS["taper_mid"])
+    tail_gain = float(appcfg.SETTINGS["taper_tail"])
     for (x, y, w), a in zip(stroke, arc):
         u = a / total
         f = 1.0
-        if u < head_u:                  # 起笔：更轻的入锋（0.32 → 1）
-            f *= 0.32 + 0.68 * ((u / head_u) ** 0.8)
-        # 行笔中段鼓肚（约 +14%，模拟饱蘸墨的笔腹）
-        f *= 1.0 + 0.14 * math.exp(-((u - 0.45) ** 2) / (2 * 0.24 ** 2))
-        if u > 1.0 - tail_u:            # 收笔：急收出锋（末端剩 ~7%）
+        if u < head_u:                  # 起笔：轻入（强度可调）
+            f *= head_start + (1.0 - head_start) * ((u / head_u) ** 0.8)
+        # 行笔中段鼓肚（模拟饱蘸墨的笔腹，强度可调）
+        f *= 1.0 + mid_gain * math.exp(-((u - 0.45) ** 2) / (2 * 0.24 ** 2))
+        if u > 1.0 - tail_u:            # 收笔：出锋（强度可调）
             k = (u - (1.0 - tail_u)) / tail_u
-            f *= 1.0 - 0.93 * (k ** 1.05)
+            f *= 1.0 - tail_gain * (k ** 1.05)
         out.append((x, y, max(0.35, w * f)))
 
     # 沿弧长做对称 3 点宽度平滑，消除台阶
@@ -564,7 +582,7 @@ class Panel(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setWindowFlag(Qt.WindowDoesNotAcceptFocus, True)
         self.setFixedSize(980, BAR_H + ECHO_H + ROW_H * N_ROWS + 40)
-        self.setWindowOpacity(DEFAULT_OPACITY)
+        self.setWindowOpacity(float(appcfg.SETTINGS["opacity"]))
 
         # 面板自持数据：每行 = 笔迹列表，每笔 = [(x, y, w), ...]（w 像素宽）
         self.rows: list[list[list[tuple]]] = [[] for _ in range(N_ROWS)]
@@ -603,7 +621,8 @@ class Panel(QWidget):
         self._ink_layer.fill(Qt.transparent)
 
         # 粒子场（环境漂浮 + 特效爆发）
-        self._parts = Particles(self.width(), self.height())
+        self._parts = Particles(self.width(), self.height(),
+                                n_ambient=int(appcfg.SETTINGS["ambient_particles"]))
         self._pt_last = 0.0
         self._part_timer = QTimer(self)
         self._part_timer.setInterval(33)            # ~30fps
@@ -709,6 +728,27 @@ class Panel(QWidget):
         except Exception:                            # noqa: BLE001
             self._bg_blur = None
 
+    def _start_live_sampler(self) -> bool:
+        """启动实时毛玻璃采样器（幂等）。成功后面板/球从捕获中排除。"""
+        if self._live is not None:
+            return True
+        sampler = BackdropSampler()
+        if not sampler.start(monitor_index=1):
+            print("[hwime] live sampler 不可用，回退静态模糊", flush=True)
+            return False
+        self._live = sampler
+        try:
+            _user32.SetWindowDisplayAffinity(
+                int(self.winId()), _WDA_EXCLUDEFROMCAPTURE)
+            ball = globals().get("_ball")
+            if ball is not None and ball.isVisible():
+                _user32.SetWindowDisplayAffinity(
+                    int(ball.winId()), _WDA_EXCLUDEFROMCAPTURE)
+        except Exception:                # noqa: BLE001
+            pass
+        print("[hwime] live backdrop sampler ON", flush=True)
+        return True
+
     def showEvent(self, ev):
         super().showEvent(ev)
         # 实时毛玻璃采样器：首次显示时启动一次（带上"从捕获中排除"标记，
@@ -717,24 +757,11 @@ class Panel(QWidget):
             self._live_started = True
 
             def _boot_live():
-                if not LIVE_BLUR or os.environ.get("QT_QPA_PLATFORM") == "offscreen":
-                    return                  # 开关关闭 / 离屏测试环境跳过
-                sampler = BackdropSampler()
-                if sampler.start(monitor_index=1):
-                    self._live = sampler
-                    try:
-                        _user32.SetWindowDisplayAffinity(
-                            int(self.winId()), _WDA_EXCLUDEFROMCAPTURE)
-                        ball = globals().get("_ball")
-                        if ball is not None and ball.isVisible():
-                            _user32.SetWindowDisplayAffinity(
-                                int(ball.winId()), _WDA_EXCLUDEFROMCAPTURE)
-                    except Exception:            # noqa: BLE001
-                        pass
-                    print("[hwime] live backdrop sampler ON", flush=True)
-                else:
-                    print("[hwime] live sampler 不可用，回退静态模糊",
-                          flush=True)
+                if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+                    return                  # 离屏测试环境跳过
+                if not bool(appcfg.SETTINGS["live_blur"]):
+                    return                  # 设置里关掉了实时模糊
+                self._start_live_sampler()
             QTimer.singleShot(80, _boot_live)
         # 亚克力染色在本机会变"实心白磨砂"（见 USE_ACRYLIC_ACCENT 注释），
         # 默认关闭；开启时才需要圆角区域裁剪防方角。
@@ -746,6 +773,25 @@ class Panel(QWidget):
                 set_round_region(hwnd, self.width(), self.height(), RADIUS)
                 enable_backdrop_blur(hwnd, ACRYLIC_TINT_PANEL)
             QTimer.singleShot(60, _apply)
+
+    def apply_settings(self):
+        """设置界面「应用」后调用：立即生效（不需重启的项）。"""
+        self.setWindowOpacity(float(appcfg.SETTINGS["opacity"]))
+        self._parts.set_ambient(int(appcfg.SETTINGS["ambient_particles"]))
+        want = bool(appcfg.SETTINGS["live_blur"])
+        if want and self._live is None and self._live_started:
+            if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+                self._start_live_sampler()
+        elif not want and self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:                # noqa: BLE001
+                pass
+            self._live = None
+            self._live_pix = None
+            self.prepare_backdrop()          # 回退静态快照
+        self.update()
+        print("[hwime] settings applied", flush=True)
 
     def _backdrop_tick(self):
         """实时模式：从采样器取最新小图 → 平滑放大当毛玻璃底图。"""
@@ -796,27 +842,28 @@ class Panel(QWidget):
         path = QPainterPath()
         path.addRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), RADIUS, RADIUS)
         p.setClipPath(path)
+        fr = int(appcfg.SETTINGS["frost"])               # 霜化浓度（设置可调）
         if self._live_pix is not None:
             p.setRenderHint(QPainter.SmoothPixmapTransform)  # 小图平滑放大=模糊
             p.drawPixmap(0, 0, w, h, self._live_pix)
-            bg = QLinearGradient(0, 0, 0, h)             # 白霜（透明度拉高些）
-            bg.setColorAt(0.0, QColor(250, 252, 255, 136))
-            bg.setColorAt(0.55, QColor(240, 245, 252, 124))
-            bg.setColorAt(1.0, QColor(226, 234, 248, 114))
+            bg = QLinearGradient(0, 0, 0, h)
+            bg.setColorAt(0.0, QColor(250, 252, 255, fr + 12))
+            bg.setColorAt(0.55, QColor(240, 245, 252, fr))
+            bg.setColorAt(1.0, QColor(226, 234, 248, fr - 10))
             p.fillPath(path, QBrush(bg))
         elif self._bg_blur is not None:
             p.setRenderHint(QPainter.SmoothPixmapTransform)
             p.drawPixmap(0, 0, w, h, self._bg_blur)
             bg = QLinearGradient(0, 0, 0, h)
-            bg.setColorAt(0.0, QColor(250, 252, 255, 136))
-            bg.setColorAt(0.55, QColor(240, 245, 252, 124))
-            bg.setColorAt(1.0, QColor(226, 234, 248, 114))
+            bg.setColorAt(0.0, QColor(250, 252, 255, fr + 12))
+            bg.setColorAt(0.55, QColor(240, 245, 252, fr))
+            bg.setColorAt(1.0, QColor(226, 234, 248, fr - 10))
             p.fillPath(path, QBrush(bg))
         else:
             bg = QLinearGradient(0, 0, 0, h)             # 无快照时纯半透明
-            bg.setColorAt(0.0, QColor(250, 252, 255, 108))
-            bg.setColorAt(0.55, QColor(240, 245, 252, 98))
-            bg.setColorAt(1.0, QColor(226, 234, 248, 90))
+            bg.setColorAt(0.0, QColor(250, 252, 255, max(30, fr - 16)))
+            bg.setColorAt(0.55, QColor(240, 245, 252, max(24, fr - 26)))
+            bg.setColorAt(1.0, QColor(226, 234, 248, max(20, fr - 34)))
             p.fillPath(path, QBrush(bg))
         p.fillPath(path, QBrush(_get_noise_pixmap()))        # 磨砂噪点
         sheen = QLinearGradient(0, 0, w * 0.7, h * 0.6)
@@ -1143,7 +1190,8 @@ class Panel(QWidget):
             d = math.hypot(dx, dy)
             if d > 0.5:
                 speed = d / max(dt, 0.004)          # px/s
-                plen = min(30.0, speed * 0.010)     # 预测 ~10ms 位移
+                pred_ms = float(appcfg.SETTINGS["predict_ms"])
+                plen = min(30.0, speed * (pred_ms / 1000.0))
                 if plen > 2.0:
                     self._pred_xy = (x1 + dx / d * plen, y1 + dy / d * plen)
         self.update(0, self._y_rows(), self.width(), ROW_H * N_ROWS)
@@ -1616,8 +1664,92 @@ def _save_ui():
     save_ui_state(state)
 
 
+def _fallback_tray_icon() -> QIcon:
+    """图标文件缺失时的兜底：程序化画一个球。"""
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(22, 33, 58))
+    p.drawEllipse(2, 2, 60, 60)
+    f = p.font()
+    f.setPixelSize(34)
+    f.setBold(True)
+    p.setFont(f)
+    p.setPen(QColor(246, 248, 252))
+    p.drawText(pm.rect(), Qt.AlignCenter, "手")
+    p.end()
+    return QIcon(pm)
+
+
+def _build_tray(app, panel, ball, hotkey_desc: str) -> QSystemTrayIcon:
+    """系统托盘：显示/隐藏、设置、开机自启、关于、退出。"""
+    icon_path = os.path.join(_ROOT, "docs", "hwime.ico")
+    icon = QIcon(icon_path) if os.path.exists(icon_path) \
+        else _fallback_tray_icon()
+    tray = QSystemTrayIcon(icon, app)
+    tray.setToolTip(f"{appcfg.APP_NAME} v{appcfg.APP_VERSION}")
+
+    tmenu = QMenu()
+
+    def open_settings():
+        from settings import SettingsDialog
+        dlg = SettingsDialog(None, hotkey_desc=hotkey_desc,
+                             on_apply=panel.apply_settings)
+        dlg.exec()
+
+    def quit_app():
+        try:
+            if panel._live is not None:
+                panel._live.stop()
+        except Exception:                    # noqa: BLE001
+            pass
+        _save_ui()
+        tray.hide()
+        app.quit()
+
+    def about():
+        QMessageBox.information(
+            None, f"关于 {appcfg.APP_NAME}",
+            f"{appcfg.APP_NAME} v{appcfg.APP_VERSION}\n\n"
+            "悬浮手写输入法：数位板连续书写中文，\n"
+            "双路识别（OCR 主导上屏 + 笔迹 CNN 纠正）。\n\n"
+            "https://github.com/Elysia-laoda/handwrite-ime")
+
+    act_toggle = tmenu.addAction("显示 / 隐藏面板")
+    act_settings = tmenu.addAction("设置…")
+    tmenu.addSeparator()
+    act_auto = tmenu.addAction("开机自动运行")
+    act_auto.setCheckable(True)
+    act_auto.setChecked(appcfg.is_autostart())
+    tmenu.addSeparator()
+    act_about = tmenu.addAction("关于")
+    act_quit = tmenu.addAction("退出")
+
+    act_toggle.triggered.connect(lambda: _toggle_panel(app))
+    act_settings.triggered.connect(open_settings)
+    act_about.triggered.connect(about)
+    act_quit.triggered.connect(quit_app)
+
+    def on_auto(checked):
+        if not appcfg.set_autostart(checked):
+            print("[hwime] 写自启动注册表失败", flush=True)
+        act_auto.setChecked(appcfg.is_autostart())
+    act_auto.toggled.connect(on_auto)
+
+    tray.activated.connect(
+        lambda reason: _toggle_panel(app)
+        if reason == QSystemTrayIcon.DoubleClick else None)
+    tray.setContextMenu(tmenu)
+    tray.show()
+    return tray
+
+
 def main():
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)     # 托盘常驻，关窗不退出
+    boot_mode = "--boot" in sys.argv         # 开机自启：静默进托盘
     user32 = ctypes.windll.user32
     # 高漫等驱动常占用 Ctrl+Alt+H：按序尝试多个候选热键
     candidates = [("Ctrl+Alt+H", ord("H")), ("Ctrl+Alt+K", ord("K")),
@@ -1672,7 +1804,12 @@ def main():
         panel._set_status(f"引擎加载中… 热键 {hotkey_desc}")
     panel.prepare_backdrop()          # 显示前采样背景（此时画面无自身/无悬浮球）
     ball.show()
-    panel.show()
+    if not boot_mode:
+        panel.show()
+    tray = _build_tray(app, panel, ball, hotkey_desc)
+    globals()["_tray"] = tray
+    print(f"[hwime] {appcfg.APP_NAME} v{appcfg.APP_VERSION} 就绪"
+          f"{'（自启动托盘模式）' if boot_mode else ''}", flush=True)
     _save_ui()
     sys.exit(app.exec())
 

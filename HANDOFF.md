@@ -93,6 +93,32 @@ smoke、SendInput 离线+真机注入、真实桌面启动+截图、双数据集
    实时性实测 PASS（背景红→蓝→黄，面板采样像素同步变化）。
    三级兜底：实时小图 → 静态快照（隐藏时抓屏）→ 纯半透明渐变。
    另：圆角收敛（面板 18→15、按钮 15→10、胶囊/判定区 10→6/7、内框→9）。
+13. **v2.9 软件化封装**（用户要求：安装器/快捷方式/系统托盘/设置界面）：
+   ① `panel/appcfg.py`——设置系统核心（SCHEMA 10 项参数、data/settings.json
+   持久化、开机自启注册表读写），纯标准库。② `panel/settings.py`——浅色
+   磨砂风格设置窗口（滑块实时数值、恢复默认、应用即生效回调）。
+   ③ `panel/main.py`——所有可调参数改为读 appcfg.SETTINGS（线宽/速度调制/
+   笔锋三项/预测ms/霜化/粒子数/不透明度）；`Panel.apply_settings()` 免重启
+   生效；`_start_live_sampler()` 拆出（设置可开关实时模糊）；系统托盘
+   `_build_tray()`（显示-隐藏/设置/开机自启/关于/退出，双击球同开关）；
+   `--boot` 静默托盘自启模式；`setQuitOnLastWindowClosed(False)`。
+   ④ `installer/installer.pyw`（tkinter 零依赖 GUI）+ `install.bat`：
+   复制 基础Python(runtime)+venv(env)+app+ref 四件套（robocopy /MT:16，
+   自动排除 .git -267MB / data / 开发残留；总计 ~29.5k 文件 1.6GB）→
+   重写 pyvenv.cfg 指向随装 runtime、剔除 editable finder →
+   生成 hwime_launch.pyw（注入 HWIME_REF + ref 入 sys.path，免 editable
+   即可 import cnn_chinese_hw）与 uninstall.pyw → 快捷方式（PowerShell
+   WScript.Shell，桌面+开始菜单）→ 卸载注册表项 HKCU\...\Uninstall\hwime
+   → 环境自检（导入 PySide6+torch+rapidocr）。安装器坑：模板字符串里
+   嵌 `'{}'.format` 与外层 `.format(install=)` 的匿名占位符冲突（IndexError，
+   实测卡死一次）→ 转义 `{{}}`；pythonw 无控制台 + 管道缓冲 ⇒ 全程
+   `filelog()` 落盘 %TEMP%\hwime_install.log 便于排查。
+   ⑤ 图标 `docs/hwime.ico`（PIL 绘制多尺寸 16-256：深蓝球+手字）。
+   ⑥ 安装布局：<install>/{runtime, env, app(+launch), ref/cnn_chinese_hw,
+   uninstall.pyw, hwime.ico}；卸载器 kill 窗口→删快捷方式/注册表→
+   detached cmd 延时 rd 自删。测试：沙盒 --test 全通过（29.5k 文件、
+   自检 PASS、装好副本裸 import 失败/launcher 路径下 Pipeline OK ——
+   证明真自包含）。
 
 ## 引擎策略结论（真实数据说话）
 
